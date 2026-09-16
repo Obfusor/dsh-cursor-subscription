@@ -861,3 +861,147 @@ test("Cursor settings RPC reads and updates only public runtime fields", async (
 		revision: 5,
 	});
 });
+
+function encodeAgentMcpArgsFrame({ id, execId, name, toolCallId, toolName, args = {} }) {
+	const mcp = new Writer();
+	mcp.string(1, name);
+	for (const [key, value] of Object.entries(args)) {
+		const entry = new Writer().string(1, key).bytes(2, encodeValue(value)).finish();
+		mcp.message(2, entry);
+	}
+	if (toolCallId) mcp.string(3, toolCallId);
+	if (toolName) mcp.string(5, toolName);
+	const exec = new Writer();
+	exec.varint(1, id);
+	if (execId) exec.string(15, execId);
+	exec.message(11, mcp.finish());
+	return new Writer().message(2, exec.finish()).finish();
+}
+
+function encodeAgentCheckpointFrame(checkpoint = new Uint8Array([9, 9, 9])) {
+	return new Writer().message(3, checkpoint).finish();
+}
+
+test("parallel MCP tool calls keep distinct DSH block indexes and resume without phantom results", async () => {
+	const tools = [
+		{ name: "bash", description: "run shell", parameters: { type: "object", properties: { command: { type: "string" } }, required: ["command"] } },
+		{ name: "grep", description: "search files", parameters: { type: "object", properties: { pattern: { type: "string" }, path: { type: "string" } }, required: ["pattern"] } },
+	];
+	const written = [];
+	const queue = [
+		{
+			flags: 0,
+			payload: encodeAgentMcpArgsFrame({
+				id: 1,
+				execId: "exec-bash",
+				name: "bash",
+				toolCallId: "tool-bash",
+				toolName: "bash",
+				args: { command: "pwd" },
+			}),
+		},
+		{
+			flags: 0,
+			payload: encodeAgentMcpArgsFrame({
+				id: 2,
+				execId: "exec-grep",
+				name: "grep",
+				toolCallId: "tool-grep",
+				toolName: "grep",
+				args: { pattern: "TODO", path: "." },
+			}),
+		},
+		// Empty/unknown MCP exec must not become a pending bridge entry.
+		{
+			flags: 0,
+			payload: encodeAgentMcpArgsFrame({
+				id: 3,
+				execId: "exec-empty",
+				name: "",
+				toolCallId: "tool-empty",
+				toolName: "",
+				args: {},
+			}),
+		},
+		{ flags: 0, payload: encodeAgentCheckpointFrame() },
+	];
+	class BridgeRun {
+		constructor() {
+			this.finished = false;
+			this.stream = { destroyed: false };
+			this.responseContentType = "application/connect+proto";
+			this.frames = {
+				next: async () => queue.shift(),
+			};
+		}
+		async start() {}
+		writeMessage(bytes) {
+			written.push(Buffer.from(bytes));
+			return true;
+		}
+		async waitForResponse() { return 200; }
+		startHeartbeat() {}
+		abort() { this.close(); }
+		close() { this.finished = true; this.stream.destroyed = true; }
+	}
+	const run = new BridgeRun();
+	const adapter = new CursorAdapter({
+		auth: { accessToken: async () => "test-token" },
+		settings: () => resolveCursorSettings(),
+		createAgentRun: () => run,
+	});
+	const first = [];
+	for await (const chunk of adapter.stream({
+		provider: "cursor-subscription",
+		model: "test-model",
+		sessionId: "mcp-parallel",
+		tools,
+		messages: [{ role: "user", content: [{ type: "text", text: "inspect" }] }],
+	})) first.push(chunk);
+
+	const toolEnds = first.filter((chunk) => chunk.type === "block-end" && chunk.block?.type === "tool-call");
+	assert.equal(toolEnds.length, 2);
+	assert.deepEqual(toolEnds.map((chunk) => chunk.block.name).sort(), ["bash", "grep"]);
+	assert.notEqual(toolEnds[0].index, toolEnds[1].index, "parallel MCP calls must use distinct DSH block indexes");
+	assert.equal(first.at(-1).type, "finish");
+	assert.deepEqual(first.at(-1).reason, { kind: "tool-calls" });
+
+	// Unknown MCP exec was rejected immediately on the open bridge.
+	const rejected = written.some((buf) => buf.includes(Buffer.from("Unknown or unsupported MCP tool")));
+	assert.equal(rejected, true);
+
+	written.length = 0;
+	const second = [];
+	for await (const chunk of adapter.stream({
+		provider: "cursor-subscription",
+		model: "test-model",
+		sessionId: "mcp-parallel",
+		tools,
+		messages: [
+			{ role: "user", content: [{ type: "text", text: "inspect" }] },
+			{
+				role: "assistant",
+				content: toolEnds.map((chunk) => ({
+					type: "tool-call",
+					id: chunk.block.id,
+					name: chunk.block.name,
+					arguments: chunk.block.arguments,
+				})),
+			},
+			{
+				role: "user",
+				content: toolEnds.map((chunk) => ({
+					type: "tool-result",
+					toolCallId: chunk.block.id,
+					content: [{ type: "text", text: `${chunk.block.name}-ok` }],
+					isError: false,
+				})),
+			},
+		],
+	})) second.push(chunk);
+
+	const phantom = written.some((buf) => buf.includes(Buffer.from("Tool result not provided")));
+	assert.equal(phantom, false, "resume must not invent Tool result not provided for real tool calls");
+	assert.equal(written.length, 2, "exactly one MCP result per pending exec");
+});
+
