@@ -60,7 +60,7 @@ Then add `dsh-cursor-subscription` to the `dsh.profile.bundles` array in `packag
 
 When a tool is required, the agent converts Cursor's tool request into a local DSH tool execution. The result is returned to the model through the conversation history; Cursor's filesystem tools are not used.
 
-The **Runtime settings** card controls the maximum tool rounds in one Cursor run and the HTTP retry policy. Retry count means additional attempts and defaults to `0` (disabled). Cursor's streaming POST protocol cannot prove that a failed attempt was not processed remotely, so enabling retries may repeat model work or usage. Retries occur only before any response output when the initial HTTP status matches the configured list.
+The **Runtime settings** card controls the maximum tool rounds in one Cursor run and the HTTP retry policy. The tool-round cap defaults to `200` (range 1–1000) and ends the run with `TOOL_LIMIT` when exceeded. Retry count means additional attempts and defaults to `0` (disabled). Cursor's streaming POST protocol cannot prove that a failed attempt was not processed remotely, so enabling retries may repeat model work or usage. Retries occur only before any response output when the initial HTTP status matches the configured list.
 
 ## Updating and Removing
 

@@ -705,7 +705,7 @@ test("Cursor Agent response requires HTTP 200 Connect protobuf", () => {
 
 test("Cursor runtime settings validate retry and tool limits", () => {
 	const defaults = resolveCursorSettings();
-	assert.equal(defaults.maxToolRounds, 64);
+	assert.equal(defaults.maxToolRounds, 200);
 	assert.equal(defaults.retryCount, 0);
 	assert.equal(defaults.retryIntervalMs, 1000);
 	assert.deepEqual(defaults.retryHttpStatusCodes, [408, 425, 429, 500, 502, 503, 504]);
@@ -908,7 +908,7 @@ test("Cursor settings RPC reads and updates only public runtime fields", async (
 	const signal = new AbortController().signal;
 	const read = await handler("settings", {}, signal);
 	assert.equal(read.ok, true);
-	assert.equal(read.value.maxToolRounds, 64);
+	assert.equal(read.value.maxToolRounds, 200);
 	assert.equal(read.value.revision, 4);
 	const updated = await handler("settings/update", {
 		revision: 4,
