@@ -825,6 +825,72 @@ test("Cursor adapter stalls when the server only sends heartbeats", async () => 
 	assert.match(finish.reason.failure.message, /progress timeout/);
 });
 
+test("Cursor adapter finishes the step when the server signals turn_ended", async () => {
+	// AgentServerMessage { interaction_update = 1 } ->
+	//   InteractionUpdate { text_delta = 1 { text = 1 } } / { turn_ended = 14 }
+	const textFrame = new Writer()
+		.message(1, new Writer().message(1, new Writer().string(1, "结论").finish()).finish())
+		.finish();
+	const turnEndedFrame = new Writer()
+		.message(1, new Writer().message(14, new Uint8Array(0)).finish())
+		.finish();
+	const heartbeatFrame = new Writer()
+		.message(1, new Writer().message(13, new Uint8Array(0)).finish())
+		.finish();
+	const queue = [
+		{ flags: 0, payload: textFrame },
+		{ flags: 0, payload: encodeAgentCheckpointFrame() },
+		{ flags: 0, payload: turnEndedFrame },
+	];
+	class TurnEndedRun {
+		constructor() {
+			this.finished = false;
+			this.stream = { destroyed: false };
+			this.responseContentType = "application/connect+proto";
+			this.frames = {
+				next: async () => {
+					if (this.failure !== undefined) throw this.failure;
+					const next = queue.shift();
+					if (next !== undefined) return next;
+					// Cursor keeps the run alive with heartbeats instead of closing
+					// it; without honoring turn_ended this becomes a progress timeout.
+					await new Promise((resolve) => setTimeout(resolve, 5));
+					return { flags: 0, payload: heartbeatFrame };
+				},
+				fail: (error) => {
+					this.failure = error;
+				},
+			};
+		}
+		async start() {}
+		writeMessage() { return true; }
+		async waitForResponse() { return 200; }
+		startHeartbeat() {}
+		abort(error) { this.frames.fail(error); this.close(); }
+		close() { this.finished = true; this.stream.destroyed = true; }
+	}
+	const run = new TurnEndedRun();
+	const adapter = new CursorAdapter({
+		auth: { accessToken: async () => "test-token" },
+		settings: () => resolveCursorSettings(),
+		createAgentRun: () => run,
+		progressTimeoutMs: 60,
+		idleCheckIntervalMs: 15,
+	});
+	const chunks = [];
+	for await (const chunk of adapter.stream({
+		provider: "cursor-subscription",
+		model: "test-model",
+		sessionId: "turn-ended-test",
+		messages: [{ role: "user", content: [{ type: "text", text: "hello" }] }],
+	})) chunks.push(chunk);
+	assert.equal(chunks.filter((chunk) => chunk.type === "text-delta").map((chunk) => chunk.text).join(""), "结论");
+	const finish = chunks.at(-1);
+	assert.equal(finish.type, "finish");
+	assert.deepEqual(finish.reason, { kind: "stop" });
+	assert.equal(run.finished, true, "turn_ended must close the run instead of waiting for the stream");
+});
+
 test("Cursor settings RPC reads and updates only public runtime fields", async () => {
 	let current = resolveCursorSettings();
 	let revision = 4;
